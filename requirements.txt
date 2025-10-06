@@ -4,4 +4,4 @@ python-docx
 PyPDF2
 streamlit-authenticator
 openai
-google-genai
+genai
