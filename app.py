@@ -21,6 +21,21 @@ from google import genai
 
 st.set_page_config(page_title="技術ニーズマッチング（Secret Files対応）", layout="wide")
 
+# === 一時診断（公開時は消してください） ===
+with st.expander("🔎 環境変数診断（公開時は非表示推奨）"):
+    import os, re
+    def mask(v): 
+        return v[:2] + "…" + v[-2:] if v and len(v) > 6 else v
+    found = {k:v for k,v in os.environ.items() if re.match(r"^(USERNAME|PASSWORD)_\d+$", k)}
+    if not found:
+        st.error("USERNAME_i / PASSWORD_i がプロセスに来ていません。Render側の設定/再起動を確認してください。")
+    else:
+        for k in sorted(found):
+            st.write(k, "=", mask(found[k]))
+
+
+
+
 # ------------------------------------------------------
 # 0) Secret Files の探索ヘルパー
 # ------------------------------------------------------
