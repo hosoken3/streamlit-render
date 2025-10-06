@@ -1,168 +1,160 @@
 # ======================================================
-# app.py : 環境変数優先（Render）＋ secrets.toml フォールバック（ローカル）
-#   - 認証: USERNAME / PASSWORD（なければ secrets から）
-#   - Gemini: GEMINI_API_KEY（なければ secrets["api"]["gemini_key"]）
-#   - 3タブ: ①マッチング実行 ②アイデア生成（Gemini）③ファイル作成
+# app.py : Render Secret Files の sample.csv / sample.pdf を読み込み
+#   - 認証: 環境変数 USERNAME_i / PASSWORD_i の「ペア一致」照合（例: USERNAME_1 と PASSWORD_1）
+#   - データ: Secret Files に置いた sample.csv / sample.pdf を優先読み込み
+#   - タブ: ①マッチング実行 ②アイデア生成（Gemini） ③ファイル作成（Word出力）
+#   - 依存: streamlit, pandas, python-docx, PyPDF2, google-genai
+#   - Secret Files の標準パス: /etc/secrets/<filename>（およびルートにも展開される場合あり）
 # ======================================================
 
 import os
+from pathlib import Path
 import streamlit as st
 import pandas as pd
 from io import BytesIO
 from docx import Document
 from PyPDF2 import PdfReader
 
-# Gemini（新SDK）
+# ==== Gemini SDK（新）====
 # pip install google-genai
 from google import genai
 
-# ------------------------------------------------------
-# 0. ページ設定
-# ------------------------------------------------------
-st.set_page_config(page_title="技術ニーズマッチング（Render環境変数対応版）", layout="wide")
+st.set_page_config(page_title="技術ニーズマッチング（Secret Files対応）", layout="wide")
 
 # ------------------------------------------------------
-# 1. シークレットの取得（環境変数を優先、無ければ secrets.toml）
+# 0) Secret Files の探索ヘルパー
 # ------------------------------------------------------
-def get_secret(key: str, default: str | None = None):
-    """環境変数 → st.secrets の順で値を取得"""
-    env_val = os.getenv(key)
-    if env_val is not None and env_val != "":
-        return env_val
-    # st.secrets に階層がある場合は別途明示で扱う（下で実装）
-    return default
+def find_secret_or_local(filename: str) -> Path | None:
+    """
+    Secret Files (/etc/secrets/<filename>) と カレント(<filename>) を優先的に探索。
+    リポジトリ同梱の data/ にも後方互換としてフォールバック。
+    """
+    candidates = [
+        Path("/etc/secrets") / filename,  # Secret Files 標準パス
+        Path.cwd() / filename,            # ルートにも展開されることがある
+        Path("data") / filename,          # 旧来フォルダ
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
 
-# 認証情報
-USERNAME = get_secret("USERNAME")
-PASSWORD = get_secret("PASSWORD")
+# ------------------------------------------------------
+# 1) 環境変数からユーザー一覧を構築（USERNAME_1/PASSWORD_1 … のペアのみ有効）
+# ------------------------------------------------------
+def load_users_from_env(max_users: int = 50):
+    users = []
+    for i in range(1, max_users + 1):
+        u = os.getenv(f"USERNAME_{i}")
+        p = os.getenv(f"PASSWORD_{i}")
+        # 片方だけは無効。ペア一致の行のみ採用。
+        if u and p:
+            users.append({"username": u, "password": p})
+    return users
 
-# フォールバック: secrets.toml（.streamlit/secrets.toml）
-# 例:
-# [auth]
-# users = [
-#   { username = "tanaka", password = "pass123" },
-#   { username = "sato",   password = "pass456" }
-# ]
-if not USERNAME or not PASSWORD:
-    # 複数ユーザー方式（配列）に対応。単一キー方式にも対応。
-    try:
-        auth_block = st.secrets.get("auth", {})
-        # ① 単一キー（USERNAME / PASSWORD）での運用
-        if not USERNAME:
-            USERNAME = auth_block.get("username", USERNAME)
-        if not PASSWORD:
-            PASSWORD = auth_block.get("password", PASSWORD)
+USERS = load_users_from_env()
 
-        # ② 複数ユーザー（users 配列）を許容：この場合は複数ユーザー認証に切り替え
-        USERS_LIST = auth_block.get("users", None)  # [{username, password}, ...]
-    except Exception:
-        USERS_LIST = None
+# ------------------------------------------------------
+# 2) Gemini API キー（環境変数）
+# ------------------------------------------------------
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+if GEMINI_API_KEY:
+    client = genai.Client(api_key=GEMINI_API_KEY)
 else:
-    USERS_LIST = None  # 環境変数で単一ユーザー運用の場合は配列は使わない
-
-# Gemini API キー（環境変数優先 → secrets["api"]["gemini_key"]）
-GEMINI_API_KEY = get_secret("GEMINI_API_KEY")
-if not GEMINI_API_KEY:
-    try:
-        GEMINI_API_KEY = st.secrets.get("api", {}).get("gemini_key", "")
-    except Exception:
-        GEMINI_API_KEY = ""
+    client = None  # UIで警告
 
 # ------------------------------------------------------
-# 2. ログイン（環境変数の単一ユーザー, または secrets の複数ユーザー）
+# 3) ログインUI（ペア一致必須）
 # ------------------------------------------------------
-def login_single_user():
-    """USERNAME/PASSWORD での単一ユーザー認証"""
-    st.title("🔒 ログイン")
-    user = st.text_input("ユーザー名を入力してください")
-    pw = st.text_input("パスワードを入力してください", type="password")
+def login_ui():
+    st.title("🔐 ログイン")
+    st.caption("※ Render の Environment に設定した USERNAME_i / PASSWORD_i のペアで認証します。")
+    in_user = st.text_input("ユーザー名")
+    in_pass = st.text_input("パスワード", type="password")
     if st.button("ログイン"):
-        if user == USERNAME and pw == PASSWORD:
+        if any(u["username"] == in_user and u["password"] == in_pass for u in USERS):
             st.session_state["logged_in"] = True
-            st.session_state["user_name"] = user
-            st.success("ログイン成功！")
+            st.session_state["user_name"] = in_user
+            st.success(f"ようこそ、{in_user} さん！")
             st.rerun()
         else:
-            st.error("ユーザー名またはパスワードが違います。")
+            st.error("ユーザー名またはパスワードが間違っています。")
 
-def login_multi_users(users_list: list[dict]):
-    """secrets.toml の [auth].users を使った複数ユーザー認証"""
-    st.title("🔒 ログイン")
-    user = st.text_input("ユーザー名を入力してください")
-    pw = st.text_input("パスワードを入力してください", type="password")
-    if st.button("ログイン"):
-        for u in users_list:
-            if user == u.get("username") and pw == u.get("password"):
-                st.session_state["logged_in"] = True
-                st.session_state["user_name"] = user
-                st.success(f"ようこそ、{user} さん！")
-                st.rerun()
-                return
-        st.error("ユーザー名またはパスワードが違います。")
-
-# ログイン状態の初期化
 if "logged_in" not in st.session_state:
     st.session_state["logged_in"] = False
 
-# ログインフロー
-if not st.session_state["logged_in"]:
-    # 環境変数に USERNAME/PASSWORD がある → 単一ユーザー認証
-    # 無い場合、secrets の users 配列があれば複数ユーザー認証
-    if USERNAME and PASSWORD:
-        login_single_user()
-    elif USERS_LIST:
-        login_multi_users(USERS_LIST)
-    else:
-        st.error("認証情報が見つかりません。Render 環境変数（USERNAME/PASSWORD）または secrets.toml を設定してください。")
+if not USERS:
+    st.error("Environment に USERNAME_1/PASSWORD_1 形式でユーザーが設定されていません。")
     st.stop()
 
-# ログイン後の表示
-st.sidebar.success(f"👤 ログイン中：{st.session_state['user_name']}")
-if st.sidebar.button("ログアウト"):
-    st.session_state["logged_in"] = False
-    st.rerun()
+if not st.session_state["logged_in"]:
+    login_ui()
+    st.stop()
+
+# ログイン後サイドバー
+with st.sidebar:
+    st.success(f"👤 ログイン中：{st.session_state['user_name']}")
+    if st.button("ログアウト"):
+        st.session_state.clear()
+        st.rerun()
 
 # ------------------------------------------------------
-# 3. CSV / PDF 読み込み
+# 4) Secret Files の sample.csv / sample.pdf を読み込み（優先）
+#    - なければ data/ などにフォールバック
+#    - さらにユーザーアップロードも可（保存はしない：Secret Files は読み取り専用）
 # ------------------------------------------------------
-@st.cache_data
-def load_csv(path="data/sample.csv"):
-    try:
-        return pd.read_csv(path)
-    except Exception as e:
-        st.warning(f"CSVの読み込みに失敗しました: {e}")
-        return pd.DataFrame()
+def load_default_csv() -> pd.DataFrame:
+    # Secret Files 优先
+    path = find_secret_or_local("sample.csv")
+    if path:
+        try:
+            return pd.read_csv(path)
+        except Exception as e:
+            st.warning(f"既定CSVの読み込みに失敗しました: {path} / {e}")
+    # 見つからないor失敗時は空
+    return pd.DataFrame()
 
-df = load_csv()
+def load_default_pdf_text() -> str:
+    path = find_secret_or_local("sample.pdf")
+    if path:
+        try:
+            reader = PdfReader(str(path))
+            return "".join(page.extract_text() or "" for page in reader.pages)
+        except Exception as e:
+            st.warning(f"既定PDFの読み込みに失敗しました: {path} / {e}")
+    return ""
 
-st.sidebar.header("📁 ファイル読込（任意）")
-uploaded_csv = st.sidebar.file_uploader("CSVをアップロード", type=["csv"])
-uploaded_pdf = st.sidebar.file_uploader("PDFをアップロード", type=["pdf"])
+df = load_default_csv()
+pdf_text = load_default_pdf_text()
 
+# サイドバー：任意アップロード（保存はせず、その場で上書き利用）
+st.sidebar.header("📁 ファイル読込（Secret Files を既定に使用）")
+st.sidebar.caption("※ Secret Files: /etc/secrets/sample.csv / sample.pdf を既定で読み込みます。アップロードは保存されません。")
+
+uploaded_csv = st.sidebar.file_uploader("CSVを一時的に差し替え（保存しません）", type=["csv"])
 if uploaded_csv:
     try:
         df = pd.read_csv(uploaded_csv)
-        st.sidebar.success("CSVを読み込みました。")
+        st.sidebar.success("CSVを読み込みました（セッション限定）。")
     except Exception as e:
         st.sidebar.error(f"CSV読込エラー: {e}")
 
-pdf_text = ""
+uploaded_pdf = st.sidebar.file_uploader("PDFを一時的に差し替え（保存しません）", type=["pdf"])
 if uploaded_pdf:
     try:
         reader = PdfReader(uploaded_pdf)
-        for page in reader.pages:
-            pdf_text += page.extract_text() or ""
-        st.sidebar.success("PDFを読み込みました。")
+        pdf_text = "".join(page.extract_text() or "" for page in reader.pages)
+        st.sidebar.success("PDFを読み込みました（セッション限定）。")
     except Exception as e:
         st.sidebar.error(f"PDF読込エラー: {e}")
 
 # ------------------------------------------------------
-# 4. メイン画面（3タブ構成）
+# 5) メイン画面（3タブ構成）
 # ------------------------------------------------------
 tab1, tab2, tab3 = st.tabs(["①マッチング実行", "②アイデア生成（Gemini）", "③ファイル作成"])
 
 # ---------------------------
-# ① マッチング実行
+# ① マッチング実行（ダミー）
 # ---------------------------
 with tab1:
     st.header("マッチング実行")
@@ -191,7 +183,7 @@ with tab1:
         df_show.insert(1, "✔選択", False)
         st.dataframe(df_show, use_container_width=True, height=300)
     else:
-        st.info("データがありません。左サイドバーからCSVをアップロードできます。")
+        st.info("データがありません。Secret Files に sample.csv を配置するか、CSVを一時アップロードしてください。")
 
 # ---------------------------
 # ② アイデア生成（Gemini）
@@ -199,20 +191,16 @@ with tab1:
 with tab2:
     st.header("💡 Gemini によるアイデア生成")
 
-    # キーチェック
     if not GEMINI_API_KEY:
-        st.error("Gemini APIキーが設定されていません。Render 環境変数 GEMINI_API_KEY か secrets.toml の [api].gemini_key を設定してください。")
+        st.error("GEMINI_API_KEY が設定されていません。Render の Environment に GEMINI_API_KEY を追加してください。")
     else:
-        # クライアント初期化
-        client = genai.Client(api_key=GEMINI_API_KEY)
-
         st.write("以下のCSVデータまたはPDF内容をもとにAIが新しいアイデアを生成します。")
         if not df.empty:
             st.dataframe(df.head(5), use_container_width=True)
         elif pdf_text:
             st.info("PDFのテキストが読み込まれています。")
         else:
-            st.info("CSVまたはPDFをアップロードしてください。")
+            st.info("CSVまたはPDF（Secret Files）をご用意いただくか、一時アップロードをご利用ください。")
 
         prompt = st.text_area(
             "🔧 プロンプト（AIへの指示文）",
@@ -222,9 +210,9 @@ with tab2:
         if st.button("🚀 Geminiでアイデア生成"):
             with st.spinner("Geminiが考え中..."):
                 try:
+                    # 入力データの要約テキスト
                     text_summary = ""
                     if not df.empty:
-                        # 先頭3行の要約
                         text_summary = "\n".join(
                             df.head(3).astype(str).fillna("").apply(lambda row: " ".join(row), axis=1)
                         )
@@ -233,21 +221,19 @@ with tab2:
 
                     full_prompt = f"{prompt}\n\n元データ:\n{text_summary}"
 
-                    # モデル名は適宜更新可（例: "gemini-1.5-flash", "gemini-2.0-flash"）
+                    # モデルは用途に応じて変更可（"gemini-2.0-flash" など）
                     resp = client.models.generate_content(
                         model="gemini-1.5-flash",
                         contents=full_prompt,
                     )
                     out = getattr(resp, "text", None) or getattr(resp, "output_text", "")
-                    if not out:
-                        out = str(resp)
                     st.success("💡 アイデア生成完了！")
-                    st.write(out)
+                    st.write(out if out else str(resp))
                 except Exception as e:
                     st.error(f"Geminiエラー: {e}")
 
 # ---------------------------
-# ③ ファイル作成
+# ③ ファイル作成（Word出力）
 # ---------------------------
 with tab3:
     st.header("📄 Wordファイル作成（ダミー）")
@@ -257,7 +243,7 @@ with tab3:
         doc = Document()
         doc.add_heading("技術ニーズ マッチング レポート（ダミー）", level=1)
         doc.add_paragraph(f"■ ログインユーザー：{st.session_state['user_name']}")
-        doc.add_paragraph("■ PDF抽出テキスト（先頭100～150文字）：")
+        doc.add_paragraph("■ PDF抽出テキスト（先頭150文字）：")
         doc.add_paragraph((pdf_text_in or "（PDF未読込）")[:150])
 
         if not df_in.empty:
