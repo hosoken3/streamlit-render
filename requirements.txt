@@ -2,3 +2,6 @@ streamlit
 pandas
 python-docx
 PyPDF2
+streamlit-authenticator
+openai
+google-genai

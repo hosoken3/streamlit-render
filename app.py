@@ -1,46 +1,66 @@
+# ======================================================
+# app.py : Gemini対応（google-genai使用）Streamlitアプリ
+# ======================================================
 
+import os
 import streamlit as st
 import pandas as pd
 from io import BytesIO
 from docx import Document
 from PyPDF2 import PdfReader
+from google import genai  # ← 新Gemini SDK
 
-st.set_page_config(page_title="技術ニーズマッチング（ダミー）", layout="wide")
+# ------------------------------------------------------
+# 0. ページ設定
+# ------------------------------------------------------
+st.set_page_config(page_title="技術ニーズマッチング（Gemini版）", layout="wide")
 
-# -----------------
-# Password (simple)
-# -----------------
-def password_protect():
-    st.title("🔒 パスワード認証")
-    pwd = st.text_input("パスワードを入力してください", type="password")
-    valid_pwd = st.secrets.get("auth", {}).get("password", None)
-    # allow env override (Render)
-    env_pwd = st.session_state.get("ENV_PWD")
-    if env_pwd:
-        valid_pwd = env_pwd
-    if pwd and valid_pwd and pwd == valid_pwd:
-        return True
-    if pwd and valid_pwd and pwd != valid_pwd:
-        st.error("パスワードが違います。")
-    elif pwd and not valid_pwd:
-        st.warning("パスワードが設定されていません。secrets.toml か環境変数で設定してください。")
-        return True
-    return False
+# ------------------------------------------------------
+# 1. ログイン設定（複数ユーザー対応）
+# ------------------------------------------------------
+# secrets.toml の例：
+# [auth]
+# users = [
+#     { username = "tanaka", password = "pass123" },
+#     { username = "sato",   password = "pass456" }
+# ]
 
-# Allow environment override easily (for demo)
-import os
-if os.getenv("STREAMLIT_AUTH_PASSWORD"):
-    if "ENV_PWD" not in st.session_state:
-        st.session_state["ENV_PWD"] = os.getenv("STREAMLIT_AUTH_PASSWORD")
+users = st.secrets["auth"]["users"]
 
-if not password_protect():
+def login():
+    """複数ユーザー対応ログイン画面"""
+    st.title("🔒 ログイン")
+    user = st.text_input("ユーザー名を入力してください")
+    pw = st.text_input("パスワードを入力してください", type="password")
+
+    if st.button("ログイン"):
+        for u in users:
+            if user == u["username"] and pw == u["password"]:
+                st.session_state["logged_in"] = True
+                st.session_state["user_name"] = user
+                st.success(f"ようこそ、{user} さん！")
+                st.rerun()
+                return
+        st.error("ユーザー名またはパスワードが違います。")
+
+# ▼セッション初期化
+if "logged_in" not in st.session_state:
+    st.session_state["logged_in"] = False
+
+# ▼ログイン状態チェック
+if not st.session_state["logged_in"]:
+    login()
     st.stop()
 
-st.caption("※ファイルの読み込みは管理者が行います。")
+# ▼ログイン後サイドバー
+st.sidebar.success(f"👤 ログイン中：{st.session_state['user_name']}")
+if st.sidebar.button("ログアウト"):
+    st.session_state["logged_in"] = False
+    st.rerun()
 
-# -----------------
-# Data Load (CSV)
-# -----------------
+# ------------------------------------------------------
+# 2. CSV / PDF 読み込み
+# ------------------------------------------------------
 @st.cache_data
 def load_csv(path="data/sample.csv"):
     try:
@@ -51,9 +71,6 @@ def load_csv(path="data/sample.csv"):
 
 df = load_csv()
 
-# -----------------
-# Sidebar Uploads
-# -----------------
 st.sidebar.header("📁 ファイル読込（任意）")
 uploaded_csv = st.sidebar.file_uploader("CSVをアップロード", type=["csv"])
 uploaded_pdf = st.sidebar.file_uploader("PDFをアップロード", type=["pdf"])
@@ -75,17 +92,20 @@ if uploaded_pdf:
     except Exception as e:
         st.sidebar.error(f"PDF読込エラー: {e}")
 
-# -----------------
-# Tabs
-# -----------------
-tab1, tab2, tab3 = st.tabs(["①マッチング実行", "②アイデア生成", "③ファイル作成"])
+# ------------------------------------------------------
+# 3. メイン画面（3タブ構成）
+# ------------------------------------------------------
+tab1, tab2, tab3 = st.tabs(["①マッチング実行", "②アイデア生成（Gemini）", "③ファイル作成"])
 
+# ---------------------------
+# ① マッチング実行
+# ---------------------------
 with tab1:
-    st.subheader("マッチング実行")
+    st.header("マッチング実行")
     col1, col2, col3 = st.columns([2,2,2])
     with col1:
         company = st.text_input("企業名：")
-        news = st.text_input("ニュース名：", placeholder="（曖昧検索）")
+        news_kw = st.text_input("ニュース名：", placeholder="（曖昧検索）")
     with col2:
         major = st.selectbox("大分類：", ["", "材料", "機械", "電気"])
     with col3:
@@ -97,44 +117,84 @@ with tab1:
             st.success("ダミー検索を実行しました。")
     with c2:
         if st.button("クリア"):
-            st.experimental_rerun()
+            st.rerun()
 
     st.markdown("### 結果一覧")
-    # 先頭にチェック列を見せるダミー
-    if not df.empty and "番号" in df.columns:
+    if not df.empty:
         df_show = df.copy()
-        df_show.insert(0, "✔選択", False)
+        if "番号" not in df_show.columns:
+            df_show.insert(0, "番号", range(1, len(df_show)+1))
+        df_show.insert(1, "✔選択", False)
         st.dataframe(df_show, use_container_width=True, height=300)
     else:
-        st.info("データがありません。左のサイドバーからCSVをアップロードできます。")
+        st.info("データがありません。左サイドバーからCSVをアップロードできます。")
 
+# ---------------------------
+# ② アイデア生成（Gemini）
+# ---------------------------
 with tab2:
-    st.subheader("アイデア生成")
-    st.write("（ダミー）元データから類似項目を抽出し、アイデア候補を表示します。")
-    if not df.empty:
-        idea_df = df.rename(columns={"技術ニュース名":"技術ニーズのニュース名"}).copy()
-        idea_df["similarity"] = [0.82, 0.77, 0.69][:len(idea_df)]
-        st.dataframe(idea_df, use_container_width=True, height=300)
-        if st.button("アイデア生成"):
-            st.success("ダミー：アイデアを生成しました。")
-    else:
-        st.info("CSVデータを読み込むと結果が表示されます。")
+    st.header("💡 Gemini によるアイデア生成")
 
+    gemini_key = st.secrets["api"].get("gemini_key", "")
+    if not gemini_key:
+        st.error("Gemini APIキーが設定されていません。[api] に gemini_key を追加してください。")
+        st.stop()
+
+    # Geminiクライアントの初期化
+    client = genai.Client(api_key=gemini_key)
+
+    st.write("以下のCSVデータまたはPDF内容をもとにAIが新しいアイデアを生成します。")
+    if not df.empty:
+        st.dataframe(df.head(5), use_container_width=True)
+    else:
+        st.info("CSVをアップロードすると、AIが内容を参照します。")
+
+    prompt = st.text_area(
+        "🔧 プロンプト（AIへの指示文）",
+        "以下の技術ニュースをもとに、新しい応用技術アイデアを3つ提案してください。"
+    )
+
+    if st.button("🚀 Geminiでアイデア生成"):
+        with st.spinner("Geminiが考え中..."):
+            text_summary = ""
+            if not df.empty:
+                text_summary = "\n".join(
+                    df.head(3).astype(str).fillna("").apply(lambda row: " ".join(row), axis=1)
+                )
+            elif pdf_text:
+                text_summary = pdf_text[:1000]
+
+            full_prompt = f"{prompt}\n\n元データ:\n{text_summary}"
+
+            try:
+                response = client.models.generate_content(
+                    model="gemini-2.0-flash",  # 最新モデル
+                    contents=full_prompt,
+                )
+                output_text = getattr(response, "text", None) or getattr(response, "output_text", "")
+                st.success("💡 アイデア生成完了！")
+                st.write(output_text if output_text else response)
+            except Exception as e:
+                st.error(f"Geminiエラー: {e}")
+
+# ---------------------------
+# ③ ファイル作成
+# ---------------------------
 with tab3:
-    st.subheader("ファイル作成")
-    st.write("選択データとPDF抽出テキストから、Wordレポートを作成します。（ダミー）")
+    st.header("📄 Wordファイル作成（ダミー）")
+    st.write("選択データとPDF内容からWordレポートを生成します。")
 
     def make_docx(df_in: pd.DataFrame, pdf_text_in: str) -> bytes:
         doc = Document()
         doc.add_heading("技術ニーズ マッチング レポート（ダミー）", level=1)
-        doc.add_paragraph("■ 生成日時：自動")
+        doc.add_paragraph(f"■ ログインユーザー：{st.session_state['user_name']}")
         doc.add_paragraph("■ PDF抽出テキスト（先頭100文字）：")
         doc.add_paragraph((pdf_text_in or "（PDF未読込）")[:100])
 
         if not df_in.empty:
             doc.add_heading("■ データ要約", level=2)
             for _, row in df_in.head(10).iterrows():
-                title = str(row.get("技術ニュース名", "（無題）"))
+                title = str(row.get("技術ニュース名", row.get("タイトル", "（無題）")))
                 company = str(row.get("企業名", ""))
                 summary = str(row.get("要約", ""))
                 doc.add_paragraph(f"・{title} / {company}")
